@@ -4,6 +4,7 @@ import datetime
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 from urllib.parse import urlparse, urlunparse
@@ -46,16 +47,6 @@ def copy_into(
     params: MutableParams | None = None,
 ) -> str:
     cparams = _params(expr, params)
-    if isinstance(cparams.file_format, ReadParquet):
-        from_ = expr.args["files"][0]
-        # parquet must use MATCH_BY_COLUMN_NAME (TODO) or a copy transformation
-        # ie: the from clause in COPY INTO must be a subquery
-        if not isinstance(from_, exp.Subquery):
-            raise snowflake.connector.errors.ProgrammingError(
-                msg="SQL compilation error:\nPARQUET file format can produce one and only one column of type variant, object, or array. Load data into separate columns using the MATCH_BY_COLUMN_NAME copy option or copy with transformation.",  # noqa: E501
-                errno=2019,
-                sqlstate="0A000",
-            )
 
     from_source = _from_source(expr)
     source = (
@@ -69,7 +60,22 @@ def copy_into(
         duck_conn.execute(sql)
         return sql
 
-    inserts = _inserts(expr, cparams, urls)
+    is_single_variant = False
+    if isinstance(cparams.file_format, ReadParquet):
+        from_ = expr.args["files"][0]
+        # Parquet requires either:
+        # 1. A copy transformation (subquery), e.g. FROM (SELECT $1:col FROM @stage)
+        # 2. MATCH_BY_COLUMN_NAME option to match parquet columns to table columns by name
+        # 3. A dest table with a single VARIANT column (loads entire row as JSON)
+        if not isinstance(from_, exp.Subquery) and cparams.match_by_column_name == MatchByColumnName.NONE:
+            is_single_variant = _is_single_variant_column_table(expr.this, duck_conn, current_database, current_schema)
+            if not is_single_variant:
+                raise snowflake.connector.errors.ProgrammingError(
+                    msg="SQL compilation error:\nPARQUET file format can produce one and only one column of type variant, object, or array. Load data into separate columns using the MATCH_BY_COLUMN_NAME copy option or copy with transformation.",  # noqa: E501
+                    errno=2019,
+                    sqlstate="0A000",
+                )
+
     table = expr.this
     if isinstance(expr.this, exp.Table):
         table = expr.this
@@ -80,6 +86,13 @@ def copy_into(
 
     schema = table.db or current_schema
     assert schema
+
+    target_columns = (
+        _get_table_columns(table, duck_conn, current_database, schema)
+        if cparams.match_by_column_name != MatchByColumnName.NONE
+        else None
+    )
+    inserts = _inserts(expr, cparams, urls, target_columns, duck_conn, is_single_variant)
 
     histories: list[LoadHistoryRecord] = []
     load_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -162,6 +175,50 @@ def _result_file_name(url: str) -> str:
     return f"{parts[-2].lower()}/{parts[-1]}"
 
 
+def _describe_table(
+    table: exp.Table,
+    duck_conn: DuckDBPyConnection,
+    current_database: str | None,
+    current_schema: str | None,
+) -> list[tuple[str, str]]:
+    """Get (column_name, data_type) pairs for a table via DESCRIBE."""
+    catalog = table.catalog or current_database
+    schema = table.db or current_schema
+    qualified_name = f"{catalog}.{schema}.{table.name}"
+
+    result = duck_conn.execute(f"DESCRIBE {qualified_name}").fetchall()
+    return [(row[0], row[1]) for row in result]
+
+
+def _is_single_variant_column_table(
+    target: exp.Expression,
+    duck_conn: DuckDBPyConnection,
+    current_database: str | None,
+    current_schema: str | None,
+) -> bool:
+    """Check if target table has exactly one column of type VARIANT (stored as JSON in DuckDB)."""
+    if isinstance(target, exp.Table):
+        table = target
+    elif isinstance(target, exp.Schema) and isinstance(target.this, exp.Table):
+        table = target.this
+    else:
+        return False
+
+    columns = _describe_table(table, duck_conn, current_database, current_schema)
+    return len(columns) == 1 and columns[0][1] == "JSON"
+
+
+def _get_table_columns(
+    table: exp.Table,
+    duck_conn: DuckDBPyConnection,
+    current_database: str | None,
+    current_schema: str | None,
+) -> list[str]:
+    """Get column names for a table."""
+    columns = _describe_table(table, duck_conn, current_database, current_schema)
+    return [col[0].upper() for col in columns]
+
+
 def _params(expr: exp.Copy, params: MutableParams | None = None) -> CopyParams:
     kwargs = {}
     force = False
@@ -202,6 +259,19 @@ def _params(expr: exp.Copy, params: MutableParams | None = None) -> CopyParams:
 
             if not (isinstance(on_error, str) and on_error.upper() == "ABORT_STATEMENT"):
                 raise NotImplementedError(param)
+        elif var == "MATCH_BY_COLUMN_NAME":
+            if isinstance(param.expression, exp.Var):
+                value = param.expression.name.upper()
+                try:
+                    kwargs["match_by_column_name"] = MatchByColumnName(value)
+                except ValueError:
+                    raise snowflake.connector.errors.ProgrammingError(
+                        msg=f"SQL compilation error:\nInvalid value '{value}' for parameter MATCH_BY_COLUMN_NAME",
+                        errno=1008,
+                        sqlstate="22023",
+                    ) from None
+            else:
+                raise NotImplementedError(f"MATCH_BY_COLUMN_NAME with {param.expression.__class__=}")
         else:
             raise ValueError(f"Unknown copy parameter: {param.this}")
 
@@ -251,8 +321,7 @@ def stage_url_from_var(
     )
     if result := duck_conn.fetchone():
         # if no URL is found, it is an internal stage ie: local directory
-        url = result[0] or stage.internal_dir(f"{database_name}.{schema_name}.{name}")
-        return url
+        return result[0] or stage.internal_dir(f"{database_name}.{schema_name}.{name}")
     else:
         raise snowflake.connector.errors.ProgrammingError(
             msg=f"SQL compilation error:\nStage '{database_name}.{schema_name}.{name}' does not exist or not authorized.",  # noqa: E501
@@ -299,7 +368,15 @@ def _urlunparse(scheme: str, netloc: str, path: str, params: str, query: str, fr
     return urlunparse((scheme, netloc, path, params, query, fragment))
 
 
-def _inserts(expr: exp.Copy, params: CopyParams, urls: list[str]) -> list[exp.Expression]:
+def _inserts(
+    expr: exp.Copy,
+    params: CopyParams,
+    urls: list[str],
+    target_columns: list[str] | None = None,
+    duck_conn: DuckDBPyConnection | None = None,
+    is_single_variant: bool = False,
+) -> list[exp.Expression]:
+    """Generate INSERT statements for COPY INTO."""
     # INTO expression
     target = expr.this
 
@@ -308,18 +385,131 @@ def _inserts(expr: exp.Copy, params: CopyParams, urls: list[str]) -> list[exp.Ex
         select = from_.this
         assert isinstance(select, exp.Select), f"{select.__class__} is not a Select"
         columns = _strip_json_extract(select).expressions
-    else:
-        columns = [exp.Column(this=exp.Identifier(this=f"column{i}")) for i in range(len(target.expressions))] or [
-            exp.Column(this=exp.Star())
+        # Subquery already specifies columns explicitly, don't use BY NAME
+        return [
+            exp.Insert(
+                this=target,
+                expression=exp.Select(expressions=columns).from_(
+                    exp.Table(this=params.file_format.read_expression(url))
+                ),
+                by_name=False,
+            )
+            for url in urls
         ]
 
+    if is_single_variant and duck_conn:
+        # Single VARIANT column: convert entire parquet row to JSON
+        inserts = []
+        for url in urls:
+            parquet_col_names = _get_parquet_column_names(url, duck_conn)
+
+            # Build json_object call: json_object('col1', col1, 'col2', col2, ...)
+            json_args = []
+            for col in parquet_col_names:
+                json_args.append(exp.Literal.string(col))
+                json_args.append(exp.Column(this=exp.Identifier(this=col, quoted=True)))
+
+            select_expr = exp.Anonymous(this="json_object", expressions=json_args)
+
+            inserts.append(
+                exp.Insert(
+                    this=target,
+                    expression=exp.Select(expressions=[select_expr]).from_(
+                        exp.Table(this=params.file_format.read_expression(url))
+                    ),
+                    by_name=False,
+                )
+            )
+        return inserts
+
+    if target_columns and duck_conn:
+        # MATCH_BY_COLUMN_NAME: match parquet columns to table columns
+        inserts = []
+        for url in urls:
+            matched_columns = _match_parquet_columns(url, target_columns, params.match_by_column_name, duck_conn)
+            # Create SELECT with matched columns (matching cols) and NULLs (unmatched table cols)
+            select_exprs = []
+            for target_col in target_columns:
+                if target_col in matched_columns:
+                    parquet_col = matched_columns[target_col]
+                    select_exprs.append(
+                        exp.Alias(
+                            this=exp.Column(this=exp.Identifier(this=parquet_col, quoted=True)),
+                            alias=exp.Identifier(this=target_col, quoted=True),
+                        )
+                    )
+                else:
+                    select_exprs.append(
+                        exp.Alias(
+                            this=exp.Null(),
+                            alias=exp.Identifier(this=target_col, quoted=True),
+                        )
+                    )
+
+            inserts.append(
+                exp.Insert(
+                    this=target,
+                    expression=exp.Select(expressions=select_exprs).from_(
+                        exp.Table(this=params.file_format.read_expression(url))
+                    ),
+                    by_name=True,
+                )
+            )
+        return inserts
+
+    # Default: no MATCH_BY_COLUMN_NAME
+    columns = [exp.Column(this=exp.Identifier(this=f"column{i}")) for i in range(len(target.expressions))] or [
+        exp.Column(this=exp.Star())
+    ]
     return [
         exp.Insert(
             this=target,
             expression=exp.Select(expressions=columns).from_(exp.Table(this=params.file_format.read_expression(url))),
+            by_name=False,
         )
         for url in urls
     ]
+
+
+def _get_parquet_column_names(url: str, duck_conn: DuckDBPyConnection) -> list[str]:
+    """Get column names from a parquet file."""
+    result = duck_conn.execute(f"SELECT name FROM parquet_schema('{url}') WHERE num_children IS NULL").fetchall()
+    return [r[0] for r in result]
+
+
+class MatchByColumnName(Enum):
+    NONE = "NONE"
+    CASE_SENSITIVE = "CASE_SENSITIVE"
+    CASE_INSENSITIVE = "CASE_INSENSITIVE"
+
+
+def _match_parquet_columns(
+    url: str,
+    target_columns: list[str],
+    match_mode: MatchByColumnName,
+    duck_conn: DuckDBPyConnection,
+) -> dict[str, str]:
+    """Match parquet columns to target table columns.
+
+    Returns:
+        Dict mapping target column name (uppercase) to parquet column name.
+        Empty dict if match_mode is NONE.
+    """
+    match match_mode:
+        case MatchByColumnName.NONE:
+            return {}
+        case MatchByColumnName.CASE_SENSITIVE:
+            parquet_col_names = _get_parquet_column_names(url, duck_conn)
+            return {col: col for col in target_columns if col in parquet_col_names}
+        case MatchByColumnName.CASE_INSENSITIVE:
+            parquet_col_names = _get_parquet_column_names(url, duck_conn)
+            matched: dict[str, str] = {}
+            for target_col in target_columns:
+                for parquet_col in parquet_col_names:
+                    if parquet_col.upper() == target_col:
+                        matched[target_col] = parquet_col
+                        break
+            return matched
 
 
 def _strip_json_extract(expr: exp.Select) -> exp.Select:
@@ -416,3 +606,4 @@ class CopyParams:
     force: bool = False
     purge: bool = False
     on_error: str = "ABORT_STATEMENT"  # Default to ABORT_STATEMENT
+    match_by_column_name: MatchByColumnName = MatchByColumnName.NONE
